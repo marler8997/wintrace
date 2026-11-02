@@ -1,0 +1,25 @@
+name: Test
+on: [pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        # windows-11-arm runs the aarch64 tests and, emulated, the x86_64 ones
+        os: [windows-latest, windows-11-arm]
+        zig: ["0.15.2", "0.17.0"]
+      fail-fast: false
+    runs-on: ${{matrix.os}}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: marler8997/setup-anyzig@master
+      - run: zig ${{ matrix.zig }} build install test --summary all -Doptimize=Debug
+      - run: zig ${{ matrix.zig }} build install test --summary all -Doptimize=ReleaseSafe
+      - run: zig ${{ matrix.zig }} build install test --summary all -Doptimize=ReleaseFast
+      - run: zig ${{ matrix.zig }} build install test --summary all -Doptimize=ReleaseSmall
+      # build.zig skips an arch the machine can't run, so make sure neither was
+      - if: matrix.os == 'windows-11-arm'
+        run: |
+          $summary = zig ${{ matrix.zig }} build test --summary all 2>&1 | Out-String
+          if ($summary -notmatch 'wintrace-aarch64' -or $summary -notmatch 'wintrace-x86_64') { $summary; exit 1 }

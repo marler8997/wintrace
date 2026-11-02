@@ -1,0 +1,14 @@
+.{
+    .name = .wintrace,
+    .fingerprint = 0x181e0240c52b0947,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.15.2",
+    .zig_version = "0.17.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}
