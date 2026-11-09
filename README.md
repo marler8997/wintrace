@@ -6,11 +6,12 @@ Zig's `std.debug` traces read the PDB at run time. A program shipped without its
 `???` and absolute addresses, and the PDB reader adds hundreds of KB to the binary and needs
 around a megabyte of stack to report a crash. wintrace walks the stack with the unwinder
 Windows itself uses for exceptions (`RtlVirtualUnwind` over each module's `.pdata`, in
-ntdll.dll), writes each frame as `module+0xoffset`, and lists the PDB identity of every module
-in the trace. It allocates nothing, stops at a stack pointer outside the thread's stack, and
-needs 4 to 8 KB of stack in a release build (up to 10 KB in Debug), ntdll's included, so it
-works from a stack overflow handler: the tests hold it to a budget and report an overflow from a
-16 KiB `SetThreadStackGuarantee`.
+ntdll.dll; on 32-bit x86, which has no `.pdata`, the frame pointer chain), writes each frame as
+`module+0xoffset`, and lists the PDB identity of every module in the trace. It allocates
+nothing, stops at a stack pointer outside the thread's stack, and needs 4 to 8 KB of stack in a
+release build (up to 10 KB in Debug), ntdll's included, so it works from a stack overflow
+handler: the tests hold it to a budget and report an overflow from a 16 KiB
+`SetThreadStackGuarantee`.
 
 ```
     wintrace
@@ -88,7 +89,16 @@ set, so a fault while tracing doesn't trace again until the stack runs out.
 Keep the PDB of each release you ship. A stripped image has no PDB identity, so build with
 `.strip = false` (ReleaseSmall strips by default) and drop the PDB from what you ship instead.
 
-Supports x86_64 and aarch64, and builds with Zig 0.15.2 and 0.17.0.
+Supports x86_64, aarch64 and x86, and builds with Zig 0.15.2 and 0.17.0.
+
+32-bit x86 has no `.pdata`, so there wintrace walks the frame pointer chain instead (each EBP
+points at its caller's saved EBP, with the return address above it). That needs frame pointers
+in the code being traced, which Zig keeps by default in every optimize mode and Windows' own
+x86 DLLs keep too. Setting `.omit_frame_pointer = true` on the wintrace module is a compile
+error; your own code has to keep them too, or its frames are missing from the trace.
+A function that faults before setting up its frame, or a frameless leaf like `__chkstk`, is
+found the way x86_64 finds a leaf without unwind info: from a return address near the top of
+the stack.
 
 ## Size
 
@@ -99,8 +109,10 @@ bytes before file alignment:
 |--------|---------|----------|
 | 0.15.2 | x86_64  | 4,072 bytes |
 | 0.15.2 | aarch64 | 3,592 bytes |
+| 0.15.2 | x86     | 3,090 bytes |
 | 0.17.0 | x86_64  | 4,096 bytes |
 | 0.17.0 | aarch64 | 3,624 bytes |
+| 0.17.0 | x86     | 3,274 bytes |
 
 The builds are reproducible and the tests check these exactly, so a change to wintrace that
 changes its size updates this table too.

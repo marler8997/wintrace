@@ -32,7 +32,15 @@
 //!     contain `|`, so the names may contain spaces.
 //!   - `... more modules`: the trace has frames in more modules than are listed.
 //!
-//! Supports x86_64 and aarch64, and builds with Zig 0.15.2 and 0.17.0.
+//! Supports x86_64, aarch64 and x86, and builds with Zig 0.15.2 and 0.17.0. x86 has no unwind
+//! info, so its frames are walked through the frame pointer chain: the code in the trace must keep
+//! frame pointers (`.omit_frame_pointer = false`), as Windows' own x86 DLLs do.
+
+comptime {
+    if (builtin.cpu.arch == .x86 and builtin.omit_frame_pointer) @compileError(
+        "wintrace on x86 walks the stack through the frame pointer, set omit_frame_pointer to false",
+    );
+}
 
 /// Writes the stack of the calling thread, starting at the caller of this function. When
 /// `first_address` is one of its return addresses, such as a panic handler's, the frames
@@ -40,11 +48,12 @@
 pub noinline fn writeCurrentStackTrace(w: *std.Io.Writer, first_address: ?usize) error{WriteFailed}!void {
     var context: windows.CONTEXT = undefined;
     RtlCaptureContext(&context);
-    // frame 0 is this function
-    var skip: usize = 1;
+    // frame 0 is this function, except on x86, where RtlCaptureContext returns its caller's
+    // caller's context, as if this function had returned
+    var skip: usize = if (builtin.cpu.arch == .x86) 0 else 1;
     if (first_address) |address| {
         var scan: Walker = undefined;
-        scan.init(&context);
+        scan.init(&context, no_leaf_scan);
         for (0..first_address_search) |i| {
             const ip = scan.next() orelse break;
             if (i > 0 and ip == address) {
@@ -53,13 +62,15 @@ pub noinline fn writeCurrentStackTrace(w: *std.Io.Writer, first_address: ?usize)
             }
         }
     }
-    try writeWalk(w, &context, skip, false);
+    try writeWalk(w, &context, skip, false, no_leaf_scan);
 }
 
 /// Writes the stack starting at `context`, such as an exception's ContextRecord. The context
-/// must be from the calling thread. Its first frame is marked ` (ip)`.
+/// must be from the calling thread. Its first frame is marked ` (ip)`. For the current stack,
+/// use writeCurrentStackTrace: on x86, RtlCaptureContext returns its caller's caller's
+/// context, so a trace from it would leave out the function that called it.
 pub fn writeStackTrace(w: *std.Io.Writer, context: *const windows.CONTEXT) error{WriteFailed}!void {
-    try writeWalk(w, context, 0, true);
+    try writeWalk(w, context, 0, true, yes_leaf_scan);
 }
 
 /// Fills `addresses` with the instruction pointer of each frame, starting at `context`, which
@@ -69,7 +80,7 @@ pub fn writeStackTrace(w: *std.Io.Writer, context: *const windows.CONTEXT) error
 /// other one is a return address.
 pub fn capture(context: *const windows.CONTEXT, addresses: []usize) usize {
     var walker: Walker = undefined;
-    walker.init(context);
+    walker.init(context, yes_leaf_scan);
     var count: usize = 0;
     while (count < addresses.len) : (count += 1) {
         addresses[count] = walker.next() orelse break;
@@ -123,13 +134,13 @@ pub fn pdbInfo(base: usize) ?PdbInfo {
     const nt = image + nt_offset;
     if (readU32(nt) != 0x4550) return null; // "PE\0\0"
     const optional = nt + 24;
-    // PE32+, the only kind a 64-bit process runs
-    if (readU16(optional) != 0x20b) return null;
+    // PE32+ in a 64-bit process, PE32 in a 32-bit one, the only kinds each runs
+    if (readU16(optional) != pe_magic) return null;
     const size_of_image = readU32(optional + 56);
-    // NumberOfRvaAndSizes; the debug directory is the 7th
-    if (readU32(optional + 108) <= 6) return null;
-    const debug_rva = readU32(optional + 112 + 6 * 8);
-    const debug_size = readU32(optional + 112 + 6 * 8 + 4);
+    // NumberOfRvaAndSizes, just before the data directories; the debug directory is the 7th
+    if (readU32(optional + pe_directories - 4) <= 6) return null;
+    const debug_rva = readU32(optional + pe_directories + 6 * 8);
+    const debug_size = readU32(optional + pe_directories + 6 * 8 + 4);
     if (debug_rva == 0 or !inImage(debug_rva, debug_size, size_of_image)) return null;
     var offset: u32 = 0;
     while (offset + 28 <= debug_size) : (offset += 28) {
@@ -169,16 +180,18 @@ const Walker = struct {
     /// stack is corrupt, so the walk stops there rather than fault reading it.
     stack_low: usize,
     stack_high: usize,
+    leaf_scan: LeafScan,
     first: bool,
     done: bool,
 
-    fn init(walker: *Walker, context: *const windows.CONTEXT) void {
+    fn init(walker: *Walker, context: *const windows.CONTEXT, leaf_scan: LeafScan) void {
         const tib = &windows.teb().NtTib;
         walker.* = .{
             .context = context.*,
             .history = std.mem.zeroes(UNWIND_HISTORY_TABLE),
             .stack_low = @intFromPtr(tib.StackLimit),
             .stack_high = @intFromPtr(tib.StackBase),
+            .leaf_scan = leaf_scan,
             .first = true,
             .done = false,
         };
@@ -187,7 +200,7 @@ const Walker = struct {
         // unwinder in an x64 process emulated on ARM64 reads it, faulting on whatever is
         // past the copy. Unwinding needs none of it.
         walker.context.ContextFlags &= ~@as(u32, switch (builtin.cpu.arch) {
-            .x86_64 => 0x40,
+            .x86_64, .x86 => 0x40,
             .aarch64 => 0x20,
             else => unreachable,
         });
@@ -196,7 +209,7 @@ const Walker = struct {
     /// Returns the next frame's instruction pointer, or null after the last frame.
     fn next(walker: *Walker) ?usize {
         if (walker.done) return null;
-        const regs = walker.context.getRegs();
+        const regs = ipSp(&walker.context);
         // An instruction pointer of 0 ends the stack, except in the first frame, which is a
         // call through a null function pointer: its caller is found like a leaf's.
         if (regs.ip == 0 and !walker.first) {
@@ -213,7 +226,9 @@ const Walker = struct {
     fn unwind(walker: *Walker, ip: usize, sp: usize) bool {
         if (!walker.onStack(sp, @sizeOf(usize))) return false;
         var image_base: usize = undefined;
-        if (RtlLookupFunctionEntry(ip, &image_base, &walker.history)) |function| {
+        if (builtin.cpu.arch == .x86) {
+            if (!walker.unwindFramePointer(ip, sp)) return false;
+        } else if (RtlLookupFunctionEntry(ip, &image_base, &walker.history)) |function| {
             var handler_data: ?*anyopaque = null;
             var establisher_frame: usize = undefined;
             _ = RtlVirtualUnwind(unw_flag_nhandler, image_base, ip, function, &walker.context, &handler_data, &establisher_frame, null);
@@ -243,9 +258,44 @@ const Walker = struct {
         }
         // The stack only grows down, so each caller's frame is above its callee's. A leaf
         // function on aarch64 needs no stack, so the innermost frame may share its caller's.
-        const caller = walker.context.getRegs();
+        const caller = ipSp(&walker.context);
         if (caller.sp > sp) return true;
         return caller.sp == sp and walker.first and caller.ip != ip;
+    }
+
+    /// x86 has no unwind info, so a frame's caller comes from the frame pointer chain: EBP
+    /// points at the caller's saved EBP, with the return address above it.
+    fn unwindFramePointer(walker: *Walker, ip: usize, sp: usize) bool {
+        const bp: usize = walker.context.Ebp;
+        // An exception can happen before the function has a frame of its own, at its first
+        // instruction or in a leaf like __chkstk, while EBP is still its caller's. Its return
+        // address is then near the top of the stack, below the caller's frame, maybe after a
+        // few pushed registers as on x86_64. A function that does have a frame can have return
+        // addresses there too, left by earlier calls, or one RaiseException keeps in its
+        // exception record, so only one from a call to near ip counts.
+        if (walker.first and walker.leaf_scan) {
+            // an EBP below the stack pointer is a register in other use, not a frame
+            const limit = if (bp >= sp and walker.onStack(bp, @sizeOf(usize))) bp else walker.stack_high;
+            var slot = sp;
+            for (0..4) |_| {
+                if (slot >= limit or !walker.onStack(slot, @sizeOf(usize))) break;
+                const value = @as(*const usize, @ptrFromInt(slot)).*;
+                slot += @sizeOf(usize);
+                if (isCode(value) and followsCall(value) and callReaches(value, ip)) {
+                    walker.context.Eip = value;
+                    walker.context.Esp = slot;
+                    return true;
+                }
+            }
+        }
+        // a frame is above the stack pointer, like everything its function pushed
+        if (bp < sp or !walker.onStack(bp, 2 * @sizeOf(usize))) return false;
+        const frame: *const [2]usize = @ptrFromInt(bp);
+        if (!isCode(frame[1])) return false;
+        walker.context.Ebp = frame[0];
+        walker.context.Eip = frame[1];
+        walker.context.Esp = bp + 2 * @sizeOf(usize);
+        return true;
     }
 
     fn onStack(walker: *const Walker, address: usize, len: usize) bool {
@@ -254,11 +304,24 @@ const Walker = struct {
     }
 };
 
+/// On x86, whether the innermost frame may not have a frame of its own yet, as at an exception
+/// (see unwindFramePointer). Only x86 walks the frame pointer chain, so elsewhere it's void.
+const LeafScan = if (builtin.cpu.arch == .x86) bool else void;
+const no_leaf_scan = if (builtin.cpu.arch == .x86) false else {};
+const yes_leaf_scan = if (builtin.cpu.arch == .x86) true else {};
+
+/// A context's instruction and stack pointers. std's x86 getRegs has no sp before Zig 0.17.
+fn ipSp(context: *const windows.CONTEXT) struct { ip: usize, sp: usize } {
+    if (builtin.cpu.arch == .x86) return .{ .ip = context.Eip, .sp = context.Esp };
+    const regs = context.getRegs();
+    return .{ .ip = regs.ip, .sp = regs.sp };
+}
+
 /// Walks from `context`, skipping `skip` frames, and writes the first `head_frames` and last
 /// `tail_frames` of the rest, with a count of those in between.
-fn writeWalk(w: *std.Io.Writer, context: *const windows.CONTEXT, skip: usize, first_is_ip: bool) error{WriteFailed}!void {
+fn writeWalk(w: *std.Io.Writer, context: *const windows.CONTEXT, skip: usize, first_is_ip: bool, leaf_scan: LeafScan) error{WriteFailed}!void {
     var walker: Walker = undefined;
-    walker.init(context);
+    walker.init(context, leaf_scan);
     for (0..skip) |_| _ = walker.next() orelse break;
     var head: [head_frames]usize = undefined;
     var tail: [tail_frames]usize = undefined;
@@ -402,20 +465,45 @@ fn moduleBase(address: usize) ?usize {
     return if (base) |b| @intFromPtr(b) else null;
 }
 
+/// Whether `address` is in a function: one with unwind info, or on x86, which has none, anywhere
+/// in an executable section.
 fn isCode(address: usize) bool {
+    if (builtin.cpu.arch == .x86) {
+        const base = moduleBase(address) orelse return false;
+        return inExecutableSection(base, address - base);
+    }
     var image_base: usize = undefined;
     return RtlLookupFunctionEntry(address, &image_base, null) != null;
 }
 
-/// Whether the instruction before `address`, which isCode, is an x86_64 call, as it is before
+/// Whether `rva` is in an executable section of the image loaded at `base`. Only reads the
+/// section headers in the image's first page, which is always mapped.
+fn inExecutableSection(base: usize, rva: usize) bool {
+    const image: [*]const u8 = @ptrFromInt(base);
+    const nt_offset = readU32(image + 0x3c);
+    if (nt_offset > 4096 - 24) return false;
+    const count = readU16(image + nt_offset + 6);
+    const sections = nt_offset + 24 + readU16(image + nt_offset + 20);
+    if (sections + @as(usize, count) * 40 > 4096) return false;
+    for (0..count) |i| {
+        const section = image + sections + i * 40;
+        const virtual_size = readU32(section + 8);
+        const virtual_address = readU32(section + 12);
+        const characteristics = readU32(section + 36);
+        if (characteristics & image_scn_mem_execute != 0 and rva >= virtual_address and rva - virtual_address < virtual_size)
+            return true;
+    }
+    return false;
+}
+
+/// Whether the instruction before `address`, which isCode, is an x86 call, as it is before
 /// a return address. A pushed pointer to a function usually isn't. Reading before it is safe:
 /// a function is in a section, which follows the image's headers.
 fn followsCall(address: usize) bool {
     const code: [*]const u8 = @ptrFromInt(address);
     // call rel32
     if ((code - 5)[0] == 0xe8) return true;
-    // call r/m64 (FF /2), whose length its ModRM and SIB bytes give; a REX prefix before it
-    // doesn't matter
+    // call r/m (FF /2), whose length its ModRM and SIB bytes give
     for (2..8) |len| {
         const op = code - len;
         const modrm = op[1];
@@ -430,6 +518,38 @@ fn followsCall(address: usize) bool {
         if (call_len == len) return true;
     }
     return false;
+}
+
+/// How far into a function an x86 leaf scan finds its return address: past a few pushes, or
+/// in __chkstk's probing loop.
+const leaf_scan_reach = 64;
+
+/// Whether the x86 call before `return_address`, which followsCall, can be to the function at
+/// `ip`, near its start. A call through a register can't be checked, so it can be, and so can
+/// a call to 0, a null function pointer.
+fn callReaches(return_address: usize, ip: usize) bool {
+    if (ip == 0) return true;
+    const code: [*]const u8 = @ptrFromInt(return_address);
+    const target = if ((code - 5)[0] == 0xe8)
+        return_address +% readU32(code - 4)
+    else if ((code - 6)[0] == 0xff and (code - 5)[0] == 0x15)
+        // call [address], through an import table
+        readPointer(readU32(code - 4)) orelse return false
+    else
+        return true;
+    if (ip >= target and ip - target < leaf_scan_reach) return true;
+    // a jmp [address] thunk to an import
+    if (!isCode(target)) return false;
+    const thunk: [*]const u8 = @ptrFromInt(target);
+    if (thunk[0] != 0xff or thunk[1] != 0x25) return false;
+    const import = readPointer(readU32(thunk + 2)) orelse return false;
+    return ip >= import and ip - import < leaf_scan_reach;
+}
+
+/// The pointer at `address`, when that's in a loaded image, as an import table is.
+fn readPointer(address: usize) ?usize {
+    if (address % @sizeOf(usize) != 0 or moduleBase(address) == null) return null;
+    return @as(*const usize, @ptrFromInt(address)).*;
 }
 
 /// Calls GetModuleFileNameW, which Microsoft's "Dynamic-Link Library Best Practices" says "can
@@ -512,7 +632,7 @@ fn readU32(p: [*]const u8) u32 {
 }
 
 /// How far into the NT headers pdbInfo reads: through the debug directory entry.
-const nt_headers_read = 24 + 112 + 7 * 8;
+const nt_headers_read = 24 + pe_directories + 7 * 8;
 /// A deep stack keeps its innermost frames, where it failed, and its outermost, where the
 /// thread started and, for a stack overflow, where the recursion began.
 const head_frames = 96;
@@ -523,17 +643,24 @@ const first_address_search = 256;
 const max_modules = 32;
 const max_path = 260;
 const unw_flag_nhandler = 0;
+const image_scn_mem_execute = 0x20000000;
+/// The optional header's magic for this process's images, and where its data directories start:
+/// PE32 has one field fewer than PE32+.
+const pe_magic: u16 = if (@sizeOf(usize) == 8) 0x20b else 0x10b;
+const pe_directories: usize = if (@sizeOf(usize) == 8) 112 else 96;
 
-/// The unwind types, which std defines only for some architectures.
+/// The unwind types, which std defines only for some architectures. x86 has none.
 const RUNTIME_FUNCTION = switch (builtin.cpu.arch) {
     .x86_64, .aarch64 => windows.RUNTIME_FUNCTION,
+    .x86 => void,
     else => @compileError(unsupported),
 };
 const UNWIND_HISTORY_TABLE = switch (builtin.cpu.arch) {
     .x86_64, .aarch64 => windows.UNWIND_HISTORY_TABLE,
+    .x86 => void,
     else => @compileError(unsupported),
 };
-const unsupported = "wintrace supports x86_64 and aarch64 Windows";
+const unsupported = "wintrace supports x86_64, aarch64 and x86 Windows";
 
 // Declared here rather than taken from std, whose parameter types differ between versions.
 extern "ntdll" fn RtlCaptureContext(context: *windows.CONTEXT) callconv(.winapi) void;
@@ -741,13 +868,24 @@ test "writeStackTrace walks from an exception's context back into the code that 
         noinline fn raise() void {
             return_address = @returnAddress();
             RaiseException(code, 0, 0, null);
+            // not a tail call, so this function's frame is in the trace
+            std.mem.doNotOptimizeAway(&return_address);
         }
     };
     const handle = AddVectoredExceptionHandler(1, &t.handler) orelse return error.TestUnexpectedResult;
     defer _ = RemoveVectoredExceptionHandler(handle);
     t.raise();
-    // the faulting instruction, in RaiseException, comes first
-    try std.testing.expect(std.mem.endsWith(u8, firstFrame(t.w.buffered()), " (ip)"));
+    // The faulting instruction, in RaiseException, comes first. Then its callers, not a copy
+    // of the first frame from the exception record RaiseException keeps on its stack: on some
+    // Windows versions a frame or more of Windows' own, then the function that called it.
+    var frames = std.mem.splitScalar(u8, t.w.buffered(), '\n');
+    try std.testing.expectEqualStrings("    wintrace", frames.next().?);
+    const ip_line = frames.next().?;
+    try std.testing.expect(std.mem.endsWith(u8, ip_line, " (ip)"));
+    var frame = frames.next().?;
+    try std.testing.expect(!std.mem.eql(u8, frame, ip_line[0 .. ip_line.len - " (ip)".len]));
+    while (testFrameAddress(frame) == null) frame = frames.next() orelse return error.TestUnexpectedResult;
+    try expectFunction(&t.raise, testFrameAddress(frame).?);
     var line_buf: [512]u8 = undefined;
     var line: std.Io.Writer = .fixed(&line_buf);
     try line.writeAll("\n    ");
@@ -763,7 +901,7 @@ test "writeStackTrace walks a context whose extended state isn't there" {
     // CONTEXT_XSTATE, as in an exception's context, but the extended state that should follow
     // the record in memory is only this stack
     context.ContextFlags |= switch (builtin.cpu.arch) {
-        .x86_64 => 0x40,
+        .x86_64, .x86 => 0x40,
         .aarch64 => 0x20,
         else => unreachable,
     };
@@ -776,7 +914,7 @@ test "writeStackTrace walks a context whose extended state isn't there" {
 test writeUtf16 {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    // 31 units, then a surrogate pair across the 32-unit chunks, an é, and a lone surrogate
+    // 31 units, then a surrogate pair across the 32-unit chunks, an Ã©, and a lone surrogate
     const text = std.unicode.utf8ToUtf16LeStringLiteral("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "\u{1F600}\u{E9}.dll") ++ [_]u16{ 0xd800, 'x' };
     try writeUtf16(&w, text);
     try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "\u{1F600}\u{E9}.dll\u{FFFD}x", w.buffered());
@@ -798,17 +936,13 @@ test "writeStackTrace walks out of a call through a null function pointer" {
         var w: std.Io.Writer = .fixed(&buf);
         fn handler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
             const context = info.ContextRecord;
-            if (!armed or info.ExceptionRecord.ExceptionCode != exception_access_violation or context.getRegs().ip != 0)
+            if (!armed or info.ExceptionRecord.ExceptionCode != exception_access_violation or ipSp(context).ip != 0)
                 return exception_continue_search;
             armed = false;
             writeStackTrace(&w, context) catch {};
             // return from the call
             switch (builtin.cpu.arch) {
-                .x86_64 => {
-                    const sp = context.getRegs().sp;
-                    context.setIp(@as(*const usize, @ptrFromInt(sp)).*);
-                    context.setSp(sp + 8);
-                },
+                .x86_64, .x86 => testReturn(context, 0),
                 .aarch64 => context.setIp(context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Lr),
                 else => unreachable,
             }
@@ -820,6 +954,10 @@ test "writeStackTrace walks out of a call through a null function pointer" {
                     \\xor %%eax, %%eax
                     \\call *%%rax
                     ::: .{ .rax = true, .memory = true }),
+                .x86 => asm volatile (
+                    \\xor %%eax, %%eax
+                    \\call *%%eax
+                    ::: .{ .eax = true, .memory = true }),
                 .aarch64 => asm volatile (
                     \\mov x16, #0
                     \\blr x16
@@ -840,9 +978,9 @@ test "writeStackTrace walks out of a call through a null function pointer" {
     try expectFunction(&t.callNull, testFrameAddress(lines.next().?) orelse return error.TestUnexpectedResult);
 }
 
-/// A leaf function without unwind info that faults, after pushing `pushes` registers on x86_64,
-/// like __chkstk. The pushed values point into the image but not at code, so a walk that took
-/// any address in a module for a return address would go wrong.
+/// A leaf function without unwind info (or on x86, without a frame) that faults, after pushing
+/// `pushes` registers on x86_64 and x86, like __chkstk. The pushed values point into the image but
+/// not at code, so a walk that took any address in a module for a return address would go wrong.
 fn faultingLeaf(comptime pushes: enum { none, two }) type {
     return struct {
         noinline fn leaf() callconv(.naked) void {
@@ -853,6 +991,15 @@ fn faultingLeaf(comptime pushes: enum { none, two }) type {
                         \\lea __ImageBase(%%rip), %%rax
                         \\push %%rax
                         \\push %%rax
+                        \\ud2
+                    ),
+                },
+                .x86 => switch (pushes) {
+                    .none => asm volatile ("ud2"),
+                    // C symbols get a leading underscore on x86
+                    .two => asm volatile (
+                        \\push $___ImageBase
+                        \\push $___ImageBase
                         \\ud2
                     ),
                 },
@@ -869,24 +1016,20 @@ fn faultingLeaf(comptime pushes: enum { none, two }) type {
 
 test "writeStackTrace walks out of a leaf function without unwind info" {
     inline for (.{ .none, .two }) |pushes| {
-        if (pushes == .two and builtin.cpu.arch != .x86_64) continue;
+        if (pushes == .two and builtin.cpu.arch == .aarch64) continue;
         const Leaf = faultingLeaf(pushes);
         const t = struct {
             var buf: [8192]u8 = undefined;
             var w: std.Io.Writer = .fixed(&buf);
             fn handler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
                 const context = info.ContextRecord;
-                const ip = context.getRegs().ip;
+                const ip = ipSp(context).ip;
                 if (ip < @intFromPtr(&Leaf.leaf) or ip >= @intFromPtr(&Leaf.leaf) + 16) return exception_continue_search;
                 w = .fixed(&buf);
                 writeStackTrace(&w, context) catch {};
                 // return from the leaf
                 switch (builtin.cpu.arch) {
-                    .x86_64 => {
-                        const sp = context.getRegs().sp + Leaf.pushed * 8;
-                        context.setIp(@as(*const usize, @ptrFromInt(sp)).*);
-                        context.setSp(sp + 8);
-                    },
+                    .x86_64, .x86 => testReturn(context, Leaf.pushed),
                     .aarch64 => context.setIp(context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Lr),
                     else => unreachable,
                 }
@@ -900,7 +1043,8 @@ test "writeStackTrace walks out of a leaf function without unwind info" {
                 std.mem.doNotOptimizeAway(&buf);
             }
         };
-        try std.testing.expect(!isCode(@intFromPtr(&Leaf.leaf)));
+        // on x86 every function counts, there's no unwind info to tell a leaf apart
+        if (builtin.cpu.arch != .x86) try std.testing.expect(!isCode(@intFromPtr(&Leaf.leaf)));
         const handle = AddVectoredExceptionHandler(1, &t.handler) orelse return error.TestUnexpectedResult;
         defer _ = RemoveVectoredExceptionHandler(handle);
         t.w = .fixed(&t.buf);
@@ -914,7 +1058,7 @@ test "writeStackTrace walks out of a leaf function without unwind info" {
 }
 
 test "a leaf's return address is the first slot after a call, not a pushed function pointer" {
-    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    if (builtin.cpu.arch == .aarch64) return error.SkipZigTest;
     const t = struct {
         var return_address: usize = 0;
         noinline fn callee() void {
@@ -929,11 +1073,65 @@ test "a leaf's return address is the first slot after a call, not a pushed funct
     try std.testing.expect(isCode(stack[0]) and isCode(stack[1]));
     var context: windows.CONTEXT = undefined;
     RtlCaptureContext(&context);
-    context.setIp(@intFromPtr(&faultingLeaf(.none).leaf));
-    context.setSp(@intFromPtr(&stack));
+    // at the first instruction of the function the return address returns from; on x86_64, a
+    // leaf without unwind info, as only those are scanned
+    testSetIp(&context, if (builtin.cpu.arch == .x86) @intFromPtr(&t.callee) else @intFromPtr(&faultingLeaf(.none).leaf));
+    testSetSp(&context, @intFromPtr(&stack));
     var addresses: [2]usize = undefined;
     try std.testing.expectEqual(2, capture(&context, &addresses));
     try std.testing.expectEqual(t.return_address, addresses[1]);
+}
+
+/// Two return addresses, each from a call to a different function.
+const TestCalls = struct {
+    var first: usize = 0;
+    var second: usize = 0;
+    noinline fn callFirst() void {
+        first = @returnAddress();
+    }
+    noinline fn callSecond() void {
+        second = @returnAddress();
+    }
+    noinline fn init() void {
+        callFirst();
+        callSecond();
+    }
+};
+
+test "on x86, a stale return address on top of a framed function's stack isn't a frame" {
+    if (builtin.cpu.arch != .x86) return error.SkipZigTest;
+    TestCalls.init();
+    // A function that faults before writing its locals, which still hold a return address
+    // from an earlier call to another function, and whose frame returns to its real caller.
+    var stack = [_]usize{ TestCalls.first, 0, 0, 0, 0, TestCalls.second, 0 };
+    std.mem.doNotOptimizeAway(&stack);
+    var context: windows.CONTEXT = undefined;
+    RtlCaptureContext(&context);
+    // in a function other than the one the stale return address returns from
+    context.Eip = @intFromPtr(&writePdbKey) + 8;
+    try std.testing.expect(context.Eip -% @intFromPtr(&TestCalls.callFirst) >= leaf_scan_reach);
+    context.Esp = @intFromPtr(&stack);
+    context.Ebp = @intFromPtr(&stack[4]);
+    var addresses: [3]usize = undefined;
+    try std.testing.expectEqual(2, capture(&context, &addresses));
+    try std.testing.expectEqual(TestCalls.second, addresses[1]);
+}
+
+test "on x86, a leaf is found while EBP holds something other than a frame" {
+    if (builtin.cpu.arch != .x86) return error.SkipZigTest;
+    TestCalls.init();
+    var stack = [_]usize{ TestCalls.first, 0 };
+    std.mem.doNotOptimizeAway(&stack);
+    var context: windows.CONTEXT = undefined;
+    RtlCaptureContext(&context);
+    // at the start of the function the return address returns from, in code that uses EBP
+    // as an ordinary register
+    context.Eip = @intFromPtr(&TestCalls.callFirst);
+    context.Esp = @intFromPtr(&stack);
+    context.Ebp = 7;
+    var addresses: [2]usize = undefined;
+    try std.testing.expectEqual(2, capture(&context, &addresses));
+    try std.testing.expectEqual(TestCalls.first, addresses[1]);
 }
 
 test "runs of a frame are collapsed across the head and tail" {
@@ -985,18 +1183,20 @@ test "writeStackTrace stops instead of faulting on a corrupt stack pointer" {
     var start: windows.CONTEXT = undefined;
     RtlCaptureContext(&start);
     // a stack whose return address points nowhere
-    var junk: [64]usize = @splat(0x4141_4141_4141_4140);
+    var junk: [64]usize = @splat(@truncate(0x4141_4141_4141_4140));
     std.mem.doNotOptimizeAway(&junk);
     const stack_high = @intFromPtr(windows.teb().NtTib.StackBase);
+    // kernel space, or on x86 the reserved top 64 KB
+    const high: usize = if (@sizeOf(usize) == 8) 0xffff_8000_0000_0000 else 0xffff_0000;
     // Not one just below stack_high: unwinding a frame there reads past the top of the stack,
     // which the walker can't check without parsing the frame's unwind info.
-    const sps = [_]usize{ 0, 0x8, @intFromPtr(&junk) + 1, 0xffff_8000_0000_0000, stack_high, @intFromPtr(&junk) };
+    const sps = [_]usize{ 0, 0x8, @intFromPtr(&junk) + 1, high, stack_high, @intFromPtr(&junk) };
     // a function with unwind info, at its first instruction, and a leaf without
     const ips = [_]usize{ @intFromPtr(&writePdbKey), @intFromPtr(&faultingLeaf(.none).leaf) };
     for (ips) |ip| for (sps) |sp| {
         var context = start;
-        context.setIp(ip);
-        context.setSp(sp);
+        testSetIp(&context, ip);
+        testSetSp(&context, sp);
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try writeStackTrace(&w, &context);
@@ -1149,11 +1349,12 @@ test "pdbInfo rejects malformed images" {
             std.mem.writeInt(u32, b[0x3c..0x40], 0x80, .little);
             b[0x80..0x84].* = "PE\x00\x00".*;
             const optional = 0x80 + 24;
-            std.mem.writeInt(u16, b[optional..][0..2], 0x20b, .little);
+            // this process's kind, PE32+ or PE32
+            std.mem.writeInt(u16, b[optional..][0..2], pe_magic, .little);
             std.mem.writeInt(u32, b[optional + 56 ..][0..4], b.len, .little); // SizeOfImage
-            std.mem.writeInt(u32, b[optional + 108 ..][0..4], 16, .little); // NumberOfRvaAndSizes
-            std.mem.writeInt(u32, b[optional + 112 + 6 * 8 ..][0..4], 0x400, .little);
-            std.mem.writeInt(u32, b[optional + 112 + 6 * 8 + 4 ..][0..4], 28, .little);
+            std.mem.writeInt(u32, b[optional + pe_directories - 4 ..][0..4], 16, .little); // NumberOfRvaAndSizes
+            std.mem.writeInt(u32, b[optional + pe_directories + 6 * 8 ..][0..4], 0x400, .little);
+            std.mem.writeInt(u32, b[optional + pe_directories + 6 * 8 + 4 ..][0..4], 28, .little);
             std.mem.writeInt(u32, b[0x400 + 12 ..][0..4], 2, .little); // CODEVIEW
             std.mem.writeInt(u32, b[0x400 + 16 ..][0..4], 24 + 5, .little); // SizeOfData
             std.mem.writeInt(u32, b[0x400 + 20 ..][0..4], 0x500, .little);
@@ -1183,11 +1384,16 @@ test "pdbInfo rejects malformed images" {
     try std.testing.expect(image.info() == null);
 
     image = .init();
-    image.set(optional + 108, 6); // no debug directory
+    image.set(optional + pe_directories - 4, 6); // no debug directory
     try std.testing.expect(image.info() == null);
 
     image = .init();
-    image.set(optional + 112 + 6 * 8, 8192 - 4); // debug directory past the image's end
+    image.set(optional + pe_directories + 6 * 8, 8192 - 4); // debug directory past the image's end
+    try std.testing.expect(image.info() == null);
+
+    image = .init();
+    // the other bitness's magic, which this process never loads
+    std.mem.writeInt(u16, image.bytes[optional..][0..2], 0x20b ^ 0x10b ^ pe_magic, .little);
     try std.testing.expect(image.info() == null);
 
     image = .init();
@@ -1216,6 +1422,17 @@ fn firstFrame(trace: []const u8) []const u8 {
 
 /// Expects the return address `address` to be in `function`, from the call it returns from.
 fn expectFunction(function: *const anyopaque, address: usize) !void {
+    if (builtin.cpu.arch == .x86) {
+        // No function table to look it up in, but the tests keep frame pointers, so a function
+        // starts with push %ebp; mov %esp, %ebp: the nearest one before the call is its start.
+        try std.testing.expect(followsCall(address));
+        const code: [*]const u8 = @ptrFromInt(address);
+        const start = for (1..4096) |back| {
+            if (std.mem.eql(u8, (code - back)[0..3], "\x55\x89\xe5")) break address - back;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@intFromPtr(function), start);
+        return;
+    }
     var image_base: usize = undefined;
     const entry = RtlLookupFunctionEntry(address - 1, &image_base, null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(function), image_base + entry.BeginAddress);
@@ -1240,6 +1457,21 @@ fn testExe() struct { base: usize, name: []const u8 } {
     const name = basename(u16, path[0..len]);
     const n = std.unicode.utf16LeToUtf8(&S.name_buf, name) catch unreachable;
     return .{ .base = @intFromPtr(base), .name = S.name_buf[0..n] };
+}
+
+/// std's x86 CONTEXT has no setIp or setSp.
+fn testSetIp(context: *windows.CONTEXT, ip: usize) void {
+    if (builtin.cpu.arch == .x86) context.Eip = ip else context.setIp(ip);
+}
+fn testSetSp(context: *windows.CONTEXT, sp: usize) void {
+    if (builtin.cpu.arch == .x86) context.Esp = sp else context.setSp(sp);
+}
+
+/// Returns from an x86_64 or x86 function that faulted after pushing `pushed` values.
+fn testReturn(context: *windows.CONTEXT, pushed: usize) void {
+    const sp = ipSp(context).sp + pushed * @sizeOf(usize);
+    testSetIp(context, @as(*const usize, @ptrFromInt(sp)).*);
+    testSetSp(context, sp + @sizeOf(usize));
 }
 
 const exception_continue_search = 0;
@@ -1272,8 +1504,7 @@ extern "kernel32" fn CreateThread(
 ) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
 extern "kernel32" fn GetExitCodeThread(thread: *anyopaque, code: *u32) callconv(.winapi) i32;
-extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
-extern "kernel32" fn ExitThread(code: u32) callconv(.winapi) noreturn;
+extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;extern "kernel32" fn ExitThread(code: u32) callconv(.winapi) noreturn;
 
 const builtin = @import("builtin");
 const std = @import("std");

@@ -3,7 +3,7 @@
 
 test "wintrace adds what README's size table says" {
     var ok = true;
-    inline for (.{ "x86_64", "aarch64" }) |arch| {
+    inline for (.{ "x86_64", "aarch64", "x86" }) |arch| {
         const added = try sectionsSize(@embedFile("with-" ++ arch)) - try sectionsSize(@embedFile("without-" ++ arch));
         if (readmeSize(builtin.zig_version_string, arch)) |expected| {
             if (added != expected) {
