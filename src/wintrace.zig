@@ -35,6 +35,8 @@
 //! Supports x86_64, aarch64 and x86, and builds with Zig 0.15.2 and 0.17.0. x86 has no unwind
 //! info, so its frames are walked through the frame pointer chain: the code in the trace must keep
 //! frame pointers (`.omit_frame_pointer = false`), as Windows' own x86 DLLs do.
+//!
+//! For crash reports with these traces, see example/main.zig.
 
 comptime {
     if (builtin.cpu.arch == .x86 and builtin.omit_frame_pointer) @compileError(
@@ -170,6 +172,148 @@ pub fn writePdbKey(w: *std.Io.Writer, guid: [16]u8, age: u32) error{WriteFailed}
     // the first three fields are little-endian
     for ([_]u8{ 3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15 }) |i| try writeHex(w, "", guid[i], 2, .upper);
     try writeHex(w, "", age, 1, .upper);
+}
+
+pub const Options = struct {
+    mode: Mode,
+};
+
+pub const Mode = enum {
+    /// Never reads the PDB at run time, keeping std's PDB reader out of the binary.
+    small,
+    /// Uses std's tracer when PDB is available (adds about 150Kb), falls back to the
+    /// small wintrace otherwise.
+    symbolize,
+};
+
+const mode: Mode = if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17)
+    @compileError("wintrace's crash reports need Zig 0.17.0 or later")
+else if (@hasDecl(root, "wintrace_options"))
+    root.wintrace_options.mode
+else
+    @compileError("wintrace's crash reports need the root to declare `pub const wintrace_options: wintrace.Options`");
+
+/// For SetThreadStackGuarantee, so a stack overflow can be reported.
+pub const stack_guarantee = 32 * 1024;
+
+pub const panic = if (builtin.os.tag == .windows)
+    std.debug.FullPanic(panicHandler)
+else
+    @compileError("wintrace.panic is only for Windows");
+
+var panicking = false;
+var reporting_exception = false;
+
+fn panicHandler(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    const first_address = first_trace_addr orelse @returnAddress();
+    if (!panicking) {
+        panicking = true;
+        if (mode == .symbolize and haveSymbols()) std.debug.defaultPanic(msg, first_address);
+        var buf: [256]u8 = undefined;
+        const stderr = std.debug.lockStderr(&buf);
+        writePanic(&stderr.file_writer.interface, msg, first_address) catch {};
+    }
+    std.process.abort();
+}
+
+fn writePanic(w: *std.Io.Writer, msg: []const u8, first_address: usize) error{WriteFailed}!void {
+    try w.print("panic: {s}\n", .{msg});
+    if (@errorReturnTrace()) |trace| if (trace.index > 0) {
+        try w.writeAll("error return context:\n");
+        try writeErrorReturnTrace(w, trace);
+        try w.writeAll("stack trace:\n");
+    };
+    try w.flush();
+    try writeCurrentStackTrace(w, first_address);
+    try w.flush();
+}
+
+/// Reports an error returned from main like std does, then exits with 1.
+pub fn exitWithErrorTrace(err: anyerror, trace: ?*std.builtin.StackTrace) noreturn {
+    if (builtin.os.tag != .windows) @compileError("wintrace.exitWithErrorTrace is only for Windows");
+    std.log.err("{t}", .{err});
+    if (trace) |t| if (mode == .symbolize and haveSymbols()) std.debug.dumpErrorReturnTrace(t) else {
+        var buf: [256]u8 = undefined;
+        const stderr = std.debug.lockStderr(&buf);
+        const w = &stderr.file_writer.interface;
+        write: {
+            writeErrorReturnTrace(w, t) catch break :write;
+            w.flush() catch break :write;
+        }
+    };
+    std.process.exit(1);
+}
+
+/// For SetUnhandledExceptionFilter. Exits with the exception code.
+pub fn unhandledExceptionFilter(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
+    comptime {
+        if (std.options.enable_segfault_handler) @compileError(
+            "std's segfault handler reports exceptions before an unhandled exception filter can, " ++
+                "set std_options.enable_segfault_handler to false",
+        );
+    }
+    // from std.process.abort
+    if (info.ExceptionRecord.ExceptionCode == exception_breakpoint) return exception_continue_search;
+    if (reporting_exception) return exception_continue_search;
+    reporting_exception = true;
+    var buf: [256]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buf);
+    defer std.debug.unlockStderr();
+    if (mode == .symbolize and info.ExceptionRecord.ExceptionCode != exception_stack_overflow and haveSymbols())
+        writeExceptionReport(stderr.terminal(), info, .std) catch {}
+    else
+        writeExceptionReport(stderr.terminal(), info, .wintrace) catch {};
+    return exception_execute_handler;
+}
+
+const Tracer = enum { std, wintrace };
+
+fn writeExceptionReport(t: std.Io.Terminal, info: *windows.EXCEPTION_POINTERS, comptime tracer: Tracer) error{WriteFailed}!void {
+    const w = t.writer;
+    const record = info.ExceptionRecord;
+    try w.print("unhandled exception 0x{X:0>8}", .{record.ExceptionCode});
+    switch (record.ExceptionCode) {
+        exception_access_violation => if (record.NumberParameters >= 2) {
+            const access = switch (record.ExceptionInformation[0]) {
+                0 => "reading",
+                1 => "writing",
+                8 => "executing",
+                else => "accessing",
+            };
+            try w.print(" (access violation {s} 0x{x})", .{ access, record.ExceptionInformation[1] });
+        },
+        exception_illegal_instruction => try w.writeAll(" (illegal instruction)"),
+        exception_stack_overflow => try w.writeAll(" (stack overflow)"),
+        exception_int_divide_by_zero => try w.writeAll(" (integer divide by zero)"),
+        else => {},
+    }
+    try w.writeAll(" at ");
+    try writeAddress(w, @intFromPtr(record.ExceptionAddress));
+    try w.writeAll("\n");
+    try w.flush();
+    switch (tracer) {
+        .std => try std.debug.writeCurrentStackTrace(.{
+            .context = &std.debug.cpu_context.fromWindowsContext(info.ContextRecord),
+            .allow_unsafe_unwind = true,
+        }, t),
+        .wintrace => try writeStackTrace(w, info.ContextRecord),
+    }
+    try w.flush();
+}
+
+fn haveSymbols() bool {
+    const di = std.debug.getSelfDebugInfo() catch return false;
+    var arena: std.heap.ArenaAllocator = .init(std.debug.getDebugInfoAllocator());
+    defer arena.deinit();
+    var symbols: std.ArrayList(std.debug.Symbol) = .empty;
+    di.getSymbols(std.Options.debug_io, arena.allocator(), arena.allocator(), @intFromPtr(&haveSymbols), false, &symbols) catch return false;
+    return symbols.items.len > 0 and symbols.items[0].name != null;
+}
+
+fn writeErrorReturnTrace(w: *std.Io.Writer, trace: *const std.builtin.StackTrace) error{WriteFailed}!void {
+    const count = @min(trace.index, trace.instruction_addresses.len);
+    try writeAddresses(w, trace.instruction_addresses[0..count], .{ .truncated = trace.index > count });
 }
 
 /// Walks the stack of the calling thread one frame at a time.
@@ -1474,10 +1618,105 @@ fn testReturn(context: *windows.CONTEXT, pushed: usize) void {
     testSetSp(context, sp + @sizeOf(usize));
 }
 
+test "a crash report: a stack overflow's uses at most half the stack guarantee" {
+    if (builtin.zig_version.minor < 17) return error.SkipZigTest;
+    const t = struct {
+        var buf: [16384]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var result: error{WriteFailed}!void = undefined;
+        var used: usize = 0;
+        threadlocal var overflowing = false;
+        fn thread(_: ?*anyopaque) callconv(.winapi) u32 {
+            var guarantee: u32 = stack_guarantee;
+            if (SetThreadStackGuarantee(&guarantee) == 0) return 2;
+            overflowing = true;
+            std.mem.doNotOptimizeAway(recurse(0));
+            return 1;
+        }
+        /// Vectored, since the test runner's handler runs before an unhandled exception filter.
+        fn handler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
+            if (info.ExceptionRecord.ExceptionCode != exception_stack_overflow or !overflowing) return exception_continue_search;
+            // the lowest byte of the pattern the report changes is how deep it went
+            var marker: u8 = 0;
+            const top = @intFromPtr(&marker) - 1024;
+            const low = @intFromPtr(windows.teb().NtTib.StackLimit);
+            const free: [*]volatile u8 = @ptrFromInt(low);
+            @memset(free[0 .. top - low], 0xaa);
+            result = writeExceptionReport(.{ .writer = &w, .mode = .no_color }, info, .wintrace);
+            const deepest = for (low..top) |a| {
+                if (free[a - low] != 0xaa) break a;
+            } else top;
+            used = @intFromPtr(&marker) - deepest;
+            ExitThread(0);
+        }
+        noinline fn recurse(depth: usize) usize {
+            var b: [4096]u8 = undefined;
+            b[depth % b.len] = @truncate(depth);
+            std.mem.doNotOptimizeAway(&b);
+            return recurse(depth + 1) + b[depth % b.len];
+        }
+    };
+    const handle = AddVectoredExceptionHandler(1, &t.handler) orelse return error.TestUnexpectedResult;
+    defer _ = RemoveVectoredExceptionHandler(handle);
+    const thread = CreateThread(null, 1024 * 1024, &t.thread, null, stack_size_param_is_a_reservation, null) orelse return error.TestUnexpectedResult;
+    defer _ = CloseHandle(thread);
+    try std.testing.expectEqual(0, WaitForSingleObject(thread, std.math.maxInt(u32)));
+    var exit_code: u32 = undefined;
+    try std.testing.expect(GetExitCodeThread(thread, &exit_code) != 0);
+    try std.testing.expectEqual(0, exit_code);
+    try t.result;
+    if (t.used > stack_guarantee / 2) {
+        std.debug.print("the report used {d} bytes of stack, over half the guarantee of {d}\n", .{ t.used, stack_guarantee });
+        return error.TestUnexpectedResult;
+    }
+    const report = t.w.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, report, "unhandled exception 0xC00000FD (stack overflow) at "));
+    try std.testing.expect(std.mem.indexOf(u8, report, " (x") != null);
+    try std.testing.expect(containsIgnoreCase(report, "\n    kernel32.dll+0x"));
+}
+
+test "a crash report: an exception's, with either trace, and what was accessed" {
+    if (builtin.zig_version.minor < 17) return error.SkipZigTest;
+    try std.testing.expect(haveSymbols());
+    var context: windows.CONTEXT = undefined;
+    RtlCaptureContext(&context);
+    var record: windows.EXCEPTION_RECORD = .{
+        .ExceptionCode = exception_access_violation,
+        .ExceptionFlags = 0,
+        .ExceptionRecord = undefined,
+        .ExceptionAddress = @ptrFromInt(ipSp(&context).ip),
+        .NumberParameters = 2,
+        .ExceptionInformation = .{ 1, 8 } ++ @as([13]usize, @splat(0)),
+    };
+    var info: windows.EXCEPTION_POINTERS = .{ .ExceptionRecord = &record, .ContextRecord = &context };
+    inline for (.{ Tracer.std, Tracer.wintrace }) |tracer| {
+        var buf: [16384]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeExceptionReport(.{ .writer = &w, .mode = .no_color }, &info, tracer);
+        const report = w.buffered();
+        try std.testing.expect(std.mem.startsWith(u8, report, "unhandled exception 0xC0000005 (access violation writing 0x8) at "));
+        // on x86 the context is in the test runner, not this test
+        try std.testing.expectEqual(tracer == .std, std.mem.indexOf(u8, report, ".zig:") != null);
+        try std.testing.expectEqual(tracer == .wintrace, std.mem.indexOf(u8, report, "\n    wintrace\n") != null);
+    }
+}
+
+test "a crash report: a panic's" {
+    if (builtin.zig_version.minor < 17) return error.SkipZigTest;
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writePanic(&w, "boom", @returnAddress());
+    try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "panic: boom\n    wintrace\n"));
+}
+
 const exception_continue_search = 0;
 const exception_continue_execution = -1;
+const exception_execute_handler = 1;
+const exception_breakpoint = 0x80000003;
 const exception_stack_overflow = 0xC00000FD;
 const exception_access_violation = 0xC0000005;
+const exception_illegal_instruction = 0xC000001D;
+const exception_int_divide_by_zero = 0xC0000094;
 /// Stack the tracing functions may use, ntdll's included: about 2 KiB more than they use on
 /// Windows 11 x64, for differences between Windows versions. Well under the 16 KiB guarantee
 /// the overflow test uses.
@@ -1504,8 +1743,10 @@ extern "kernel32" fn CreateThread(
 ) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
 extern "kernel32" fn GetExitCodeThread(thread: *anyopaque, code: *u32) callconv(.winapi) i32;
-extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;extern "kernel32" fn ExitThread(code: u32) callconv(.winapi) noreturn;
+extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn ExitThread(code: u32) callconv(.winapi) noreturn;
 
 const builtin = @import("builtin");
+const root = @import("root");
 const std = @import("std");
 const windows = std.os.windows;

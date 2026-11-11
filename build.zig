@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
         .root_module = size_test,
     })).step);
 
+    if (@import("builtin").zig_version.minor >= 17) addExample(b, test_step, optimize, wintrace);
+
     // wintrace-symbolize itself, on a trace from a program built here
     if (host.os.tag == .windows) {
         const fixture = addFixture(b, target, optimize, true);
@@ -137,6 +139,36 @@ pub fn build(b: *std.Build) void {
         no_args.addCheck(.{ .expect_stderr_match = "usage: " });
         no_args.expectExitCode(2);
         test_step.dependOn(&no_args.step);
+    }
+}
+
+/// example/main.zig, built for Windows and Linux, and on Windows, crashed each way it can.
+fn addExample(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.OptimizeMode, wintrace: *std.Build.Module) void {
+    for ([_]std.Target.Os.Tag{ .windows, .linux }) |os| {
+        const target = b.resolveTargetQuery(.{ .os_tag = os });
+        const exe = b.addExecutable(.{
+            .name = "example",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("example/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        if (os == .windows) exe.root_module.addImport("wintrace", wintrace);
+        test_step.dependOn(&exe.step);
+        if (os != .windows or b.graph.host.result.os.tag != .windows) continue;
+        for ([_][2][]const u8{
+            .{ "panic", "panic: example panic" },
+            .{ "segfault", "unhandled exception 0xC0000005 (access violation writing 0x8) at " },
+            .{ "overflow", "unhandled exception 0xC00000FD (stack overflow) at " },
+            .{ "error", "error: ExampleError" },
+        }) |crash| {
+            const run = b.addRunArtifact(exe);
+            run.setName(b.fmt("example {s}", .{crash[0]}));
+            run.addArg(crash[0]);
+            run.addCheck(.{ .expect_stderr_match = crash[1] });
+            test_step.dependOn(&run.step);
+        }
     }
 }
 
