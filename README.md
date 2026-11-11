@@ -63,7 +63,8 @@ if (target.result.os.tag == .windows) {
 
 `wintrace_options.mode` is one of:
 
-- `.small`: never reads the PDB at run time.
+- `.small`: never reads the PDB at run time, and writes its reports straight to the stderr
+  handle. std's stderr lock isn't taken, since it goes through `std.Io.Threaded`, about 300 KB.
 - `.symbolize`: when the PDB is beside the exe, crash reports print std's traces instead, with
   function names and source lines. Adds about 150 KB.
 
@@ -94,19 +95,27 @@ the frame pointer chain there: keep frame pointers (Zig does by default) or fram
 
 ## Size
 
-What wintrace adds to a ReleaseSmall exe that already writes to a `std.Io.Writer`, in section
-bytes before file alignment:
+In section bytes before file alignment, what a ReleaseSmall exe gains from:
 
-| Zig    | arch    | wintrace |
-|--------|---------|----------|
-| 0.15.2 | x86_64  | 4,072 bytes |
-| 0.15.2 | aarch64 | 3,592 bytes |
-| 0.15.2 | x86     | 3,090 bytes |
-| 0.17.0 | x86_64  | 4,096 bytes |
-| 0.17.0 | aarch64 | 3,624 bytes |
-| 0.17.0 | x86     | 3,274 bytes |
+- wintrace: writing a trace, in an exe that already writes to a `std.Io.Writer`
+- crash reports: all three of the `.small` mode's reports, in an exe that already calls
+  `memcpy`, `memmove` and `memset`. This includes the trace above and std's `Io.Writer`.
+
+| Zig    | arch    | wintrace | crash reports |
+|--------|---------|----------|---------------|
+| 0.15.2 | x86_64  | 4,072 bytes | |
+| 0.15.2 | aarch64 | 3,592 bytes | |
+| 0.15.2 | x86     | 3,090 bytes | |
+| 0.17.0 | x86_64  | 4,096 bytes | 7,900 bytes |
+| 0.17.0 | aarch64 | 3,624 bytes | 7,420 bytes |
+| 0.17.0 | x86     | 3,274 bytes | 6,343 bytes |
 
 The tests check this table exactly.
+
+Not in the table: with Zig 0.17 on x86_64, an exe's first call to `memcpy`, `memmove` or
+`memset` adds 46 KB, wintrace's or not. The routines are under 100 bytes each, but they come
+with the rest of compiler-rt (its trigonometry and float conversions), which the linker doesn't
+drop.
 
 ## License
 

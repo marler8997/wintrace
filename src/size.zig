@@ -5,7 +5,7 @@ test "wintrace adds what README's size table says" {
     var ok = true;
     inline for (.{ "x86_64", "aarch64", "x86" }) |arch| {
         const added = try sectionsSize(@embedFile("with-" ++ arch)) - try sectionsSize(@embedFile("without-" ++ arch));
-        if (readmeSize(builtin.zig_version_string, arch)) |expected| {
+        if (readmeSize(builtin.zig_version_string, arch, .wintrace)) |expected| {
             if (added != expected) {
                 std.debug.print("Zig {s} {s}: wintrace adds {d} bytes, README.md says {d}\n", .{ builtin.zig_version_string, arch, added, expected });
                 ok = false;
@@ -16,6 +16,26 @@ test "wintrace adds what README's size table says" {
         }
     }
     if (!ok) return error.TestUnexpectedResult;
+}
+
+test "the small mode's crash reports add what README's size table says" {
+    // they need Zig 0.17, and without it build.zig doesn't build the images
+    if (builtin.zig_version.minor < 17) return error.SkipZigTest else {
+        var ok = true;
+        inline for (.{ "x86_64", "aarch64", "x86" }) |arch| {
+            const added = try sectionsSize(@embedFile("reports-with-" ++ arch)) - try sectionsSize(@embedFile("reports-without-" ++ arch));
+            if (readmeSize(builtin.zig_version_string, arch, .reports)) |expected| {
+                if (added != expected) {
+                    std.debug.print("Zig {s} {s}: the small mode's crash reports add {d} bytes, README.md says {d}\n", .{ builtin.zig_version_string, arch, added, expected });
+                    ok = false;
+                }
+            } else {
+                std.debug.print("README.md has no '| {s} | {s} | N bytes | N bytes |' row; the small mode's crash reports add {d}\n", .{ builtin.zig_version_string, arch, added });
+                ok = false;
+            }
+        }
+        if (!ok) return error.TestUnexpectedResult;
+    }
 }
 
 /// The size of every section of a PE image, without the padding that file alignment adds.
@@ -30,13 +50,23 @@ fn sectionsSize(image: []const u8) !u64 {
     return total;
 }
 
-/// From README's size table, a row like "| 0.17.0 | x86_64 | 6,468 bytes |".
-fn readmeSize(zig_version: []const u8, arch: []const u8) ?u64 {
+const Column = enum { wintrace, reports };
+
+/// From README's size table, a row like "| 0.17.0 | x86_64 | 4,096 bytes | 7,900 bytes |".
+fn readmeSize(zig_version: []const u8, arch: []const u8, column: Column) ?u64 {
     var lines = std.mem.splitScalar(u8, @embedFile("readme"), '\n');
     while (lines.next()) |line| {
         var cells = std.mem.tokenizeAny(u8, line, "| \r");
         if (!std.mem.eql(u8, cells.next() orelse continue, zig_version)) continue;
         if (!std.mem.eql(u8, cells.next() orelse continue, arch)) continue;
+        const cells_before: usize = switch (column) {
+            .wintrace => 0,
+            .reports => 1,
+        };
+        for (0..cells_before) |_| {
+            _ = cells.next() orelse return null;
+            if (!std.mem.eql(u8, cells.next() orelse return null, "bytes")) return null;
+        }
         const size = cells.next() orelse return null;
         if (!std.mem.eql(u8, cells.next() orelse return null, "bytes")) return null;
         var n: u64 = 0;
