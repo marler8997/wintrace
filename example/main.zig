@@ -7,9 +7,9 @@ pub const std_options: std.Options = .{ .enable_segfault_handler = builtin.os.ta
 
 pub fn main(init: std.process.Init.Minimal) !void {
     if (builtin.os.tag == .windows) {
-        if (SetUnhandledExceptionFilter(&wintrace.unhandledExceptionFilter) != null) unreachable;
+        if (wintrace.SetUnhandledExceptionFilter(&wintrace.unhandledExceptionFilter) != null) unreachable;
         var guarantee: u32 = wintrace.stack_guarantee;
-        if (SetThreadStackGuarantee(&guarantee) == 0) std.debug.panic(
+        if (wintrace.SetThreadStackGuarantee(&guarantee) == 0) std.debug.panic(
             "SetThreadStackGuarantee failed, error={d}",
             .{std.os.windows.GetLastError()},
         );
@@ -39,11 +39,6 @@ noinline fn recurse(depth: usize) usize {
     std.mem.doNotOptimizeAway(&buf);
     return recurse(depth + 1) + buf[depth % buf.len];
 }
-
-extern "kernel32" fn SetUnhandledExceptionFilter(
-    filter: ?*const fn (*std.os.windows.EXCEPTION_POINTERS) callconv(.winapi) c_long,
-) callconv(.winapi) ?*const anyopaque;
-extern "kernel32" fn SetThreadStackGuarantee(size: *u32) callconv(.winapi) i32;
 
 const builtin = @import("builtin");
 const std = @import("std");

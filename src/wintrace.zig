@@ -196,6 +196,11 @@ else
 /// For SetThreadStackGuarantee, so a stack overflow can be reported.
 pub const stack_guarantee = 32 * 1024;
 
+pub extern "kernel32" fn SetUnhandledExceptionFilter(
+    filter: ?*const fn (*windows.EXCEPTION_POINTERS) callconv(.winapi) c_long,
+) callconv(.winapi) ?*const anyopaque;
+pub extern "kernel32" fn SetThreadStackGuarantee(size: *u32) callconv(.winapi) i32;
+
 pub const panic = if (builtin.os.tag == .windows)
     std.debug.FullPanic(panicHandler)
 else
@@ -1732,7 +1737,6 @@ extern "kernel32" fn AddVectoredExceptionHandler(
 ) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn RemoveVectoredExceptionHandler(handle: *anyopaque) callconv(.winapi) u32;
 extern "kernel32" fn RaiseException(code: u32, flags: u32, count: u32, args: ?[*]const usize) callconv(.winapi) void;
-extern "kernel32" fn SetThreadStackGuarantee(size: *u32) callconv(.winapi) i32;
 extern "kernel32" fn CreateThread(
     attributes: ?*anyopaque,
     stack_size: usize,
