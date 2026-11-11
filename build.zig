@@ -70,12 +70,39 @@ pub fn build(b: *std.Build) void {
             });
         }
     }
+    // The same for the crash reports in the small mode. A report that reaches std's debug io
+    // adds about 300 KB, which is what this is here to catch.
+    if (have_reports) for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64, .x86 }) |arch| {
+        const fixture_target = b.resolveTargetQuery(.{ .cpu_arch = arch, .os_tag = .windows });
+        for ([_]bool{ false, true }) |reports| {
+            const name = b.fmt("reports-{s}-{s}", .{ if (reports) "with" else "without", @tagName(arch) });
+            size_test.addAnonymousImport(name, .{
+                .root_source_file = addReportsFixture(b, fixture_target, reports).getEmittedBin(),
+            });
+        }
+    };
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .name = "size",
         .root_module = size_test,
     })).step);
 
-    if (@import("builtin").zig_version.minor >= 17) addExample(b, test_step, optimize, wintrace);
+    if (have_reports) addExample(b, test_step, optimize, wintrace);
+
+    // the small mode's reports, which write to stderr themselves
+    if (have_reports and host.os.tag == .windows) {
+        const fixture = addReportsFixture(b, target, true);
+        for ([_][2][]const u8{
+            .{ "panic", "panic: fixture panic\n    wintrace\n    fixture-reports.exe+0x" },
+            .{ "segfault", "unhandled exception 0xC0000005 (access violation writing 0x8) at fixture-reports.exe+0x" },
+            .{ "error", "error: FixtureError\n" },
+        }) |crash| {
+            const run = b.addRunArtifact(fixture);
+            run.setName(b.fmt("small mode {s}", .{crash[0]}));
+            run.addArg(crash[0]);
+            run.addCheck(.{ .expect_stderr_match = crash[1] });
+            test_step.dependOn(&run.step);
+        }
+    }
 
     // wintrace-symbolize itself, on a trace from a program built here
     if (host.os.tag == .windows) {
@@ -170,6 +197,29 @@ fn addExample(b: *std.Build, test_step: *std.Build.Step, optimize: std.builtin.O
             test_step.dependOn(&run.step);
         }
     }
+}
+
+/// The crash reports need Zig 0.17.
+const have_reports = @import("builtin").zig_version.minor >= 17;
+
+/// src/fixture-reports.zig in ReleaseSmall, with or without wintrace's crash reports.
+fn addReportsFixture(b: *std.Build, target: std.Build.ResolvedTarget, reports: bool) *std.Build.Step.Compile {
+    const options = b.addOptions();
+    options.addOption(bool, "reports", reports);
+    return b.addExecutable(.{
+        .name = "fixture-reports",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fixture-reports.zig"),
+            .target = target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{
+                .{ .name = "options", .module = options.createModule() },
+                .{ .name = "wintrace", .module = b.createModule(.{
+                    .root_source_file = b.path("src/wintrace.zig"),
+                }) },
+            },
+        }),
+    });
 }
 
 /// src/fixture.zig, with or without wintrace.

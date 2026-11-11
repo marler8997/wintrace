@@ -214,16 +214,69 @@ fn panicHandler(msg: []const u8, first_trace_addr: ?usize) noreturn {
     const first_address = first_trace_addr orelse @returnAddress();
     if (!panicking) {
         panicking = true;
-        if (mode == .symbolize and haveSymbols()) std.debug.defaultPanic(msg, first_address);
         var buf: [256]u8 = undefined;
-        const stderr = std.debug.lockStderr(&buf);
-        writePanic(&stderr.file_writer.interface, msg, first_address) catch {};
+        switch (mode) {
+            .small => {
+                var stderr = smallStderr(&buf);
+                writePanic(&stderr, msg, first_address) catch {};
+            },
+            .symbolize => {
+                if (haveSymbols()) std.debug.defaultPanic(msg, first_address);
+                const stderr = std.debug.lockStderr(&buf);
+                writePanic(&stderr.file_writer.interface, msg, first_address) catch {};
+            },
+        }
     }
     std.process.abort();
 }
 
+/// Where the small mode writes its reports: straight to the stderr handle, without std's
+/// stderr lock. std.debug.lockStderr goes through std's debug io, which puts std.Io.Threaded
+/// in the exe, about 300 KB that the small mode exists to avoid. build.zig's size test fails
+/// if a report in the small mode reaches it again.
+fn smallStderr(buffer: []u8) std.Io.Writer {
+    return .{ .vtable = &.{ .drain = drainSmallStderr }, .buffer = buffer };
+}
+
+fn drainSmallStderr(w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
+    try writeSmallStderr(w.buffered());
+    w.end = 0;
+    var written: usize = 0;
+    for (data[0 .. data.len - 1]) |bytes| {
+        try writeSmallStderr(bytes);
+        written += bytes.len;
+    }
+    const last = data[data.len - 1];
+    for (0..splat) |_| try writeSmallStderr(last);
+    return written + splat * last.len;
+}
+
+fn writeSmallStderr(bytes: []const u8) error{WriteFailed}!void {
+    var rest = bytes;
+    while (rest.len > 0) {
+        var io_status: [2]usize = undefined;
+        const status = NtWriteFile(
+            windows.peb().ProcessParameters.hStdError,
+            null,
+            null,
+            null,
+            &io_status,
+            rest.ptr,
+            @intCast(rest.len),
+            null,
+            null,
+        );
+        // no stderr, or a pipe nobody reads anymore
+        if (status < 0 or io_status[1] == 0) return error.WriteFailed;
+        rest = rest[io_status[1]..];
+    }
+}
+
 fn writePanic(w: *std.Io.Writer, msg: []const u8, first_address: usize) error{WriteFailed}!void {
-    try w.print("panic: {s}\n", .{msg});
+    // in pieces, here and in the other reports: std.fmt is several KB that the traces don't need
+    try w.writeAll("panic: ");
+    try w.writeAll(msg);
+    try w.writeAll("\n");
     if (@errorReturnTrace()) |trace| if (trace.index > 0) {
         try w.writeAll("error return context:\n");
         try writeErrorReturnTrace(w, trace);
@@ -237,6 +290,19 @@ fn writePanic(w: *std.Io.Writer, msg: []const u8, first_address: usize) error{Wr
 /// Reports an error returned from main like std does, then exits with 1.
 pub fn exitWithErrorTrace(err: anyerror, trace: ?*std.builtin.StackTrace) noreturn {
     if (builtin.os.tag != .windows) @compileError("wintrace.exitWithErrorTrace is only for Windows");
+    if (mode == .small) {
+        // not std.log, its default logFn writes through std's debug io, see smallStderr
+        var buf: [256]u8 = undefined;
+        var stderr = smallStderr(&buf);
+        write: {
+            stderr.writeAll("error: ") catch break :write;
+            stderr.writeAll(@errorName(err)) catch break :write;
+            stderr.writeAll("\n") catch break :write;
+            if (trace) |t| writeErrorReturnTrace(&stderr, t) catch break :write;
+            stderr.flush() catch break :write;
+        }
+        std.process.exit(1);
+    }
     std.log.err("{t}", .{err});
     if (trace) |t| if (mode == .symbolize and haveSymbols()) std.debug.dumpErrorReturnTrace(t) else {
         var buf: [256]u8 = undefined;
@@ -263,6 +329,11 @@ pub fn unhandledExceptionFilter(info: *windows.EXCEPTION_POINTERS) callconv(.win
     if (reporting_exception) return exception_continue_search;
     reporting_exception = true;
     var buf: [256]u8 = undefined;
+    if (mode == .small) {
+        var stderr = smallStderr(&buf);
+        writeExceptionReport(.{ .writer = &stderr, .mode = .no_color }, info, .wintrace) catch {};
+        return exception_execute_handler;
+    }
     const stderr = std.debug.lockStderr(&buf);
     defer std.debug.unlockStderr();
     if (mode == .symbolize and info.ExceptionRecord.ExceptionCode != exception_stack_overflow and haveSymbols())
@@ -277,7 +348,7 @@ const Tracer = enum { std, wintrace };
 fn writeExceptionReport(t: std.Io.Terminal, info: *windows.EXCEPTION_POINTERS, comptime tracer: Tracer) error{WriteFailed}!void {
     const w = t.writer;
     const record = info.ExceptionRecord;
-    try w.print("unhandled exception 0x{X:0>8}", .{record.ExceptionCode});
+    try writeHex(w, "unhandled exception 0x", record.ExceptionCode, 8, .upper);
     switch (record.ExceptionCode) {
         exception_access_violation => if (record.NumberParameters >= 2) {
             const access = switch (record.ExceptionInformation[0]) {
@@ -286,7 +357,10 @@ fn writeExceptionReport(t: std.Io.Terminal, info: *windows.EXCEPTION_POINTERS, c
                 8 => "executing",
                 else => "accessing",
             };
-            try w.print(" (access violation {s} 0x{x})", .{ access, record.ExceptionInformation[1] });
+            try w.writeAll(" (access violation ");
+            try w.writeAll(access);
+            try writeHex(w, " 0x", record.ExceptionInformation[1], 1, .lower);
+            try w.writeAll(")");
         },
         exception_illegal_instruction => try w.writeAll(" (illegal instruction)"),
         exception_stack_overflow => try w.writeAll(" (stack overflow)"),
@@ -828,6 +902,17 @@ extern "ntdll" fn RtlVirtualUnwind(
     establisher_frame: *usize,
     context_pointers: ?*anyopaque,
 ) callconv(.winapi) ?*anyopaque;
+extern "ntdll" fn NtWriteFile(
+    file: ?*anyopaque,
+    event: ?*anyopaque,
+    apc_routine: ?*anyopaque,
+    apc_context: ?*anyopaque,
+    io_status: *[2]usize,
+    buffer: [*]const u8,
+    length: u32,
+    byte_offset: ?*i64,
+    key: ?*u32,
+) callconv(.winapi) i32;
 extern "ntdll" fn RtlPcToFileHeader(pc: usize, base: *?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetModuleFileNameW(module: *anyopaque, name: [*]u16, size: u32) callconv(.winapi) u32;
 extern "ntdll" fn RtlUnicodeToUTF8N(
