@@ -106,9 +106,9 @@ In section bytes before file alignment, what a ReleaseSmall exe gains from:
 | 0.15.2 | x86_64  | 4,072 bytes | |
 | 0.15.2 | aarch64 | 3,592 bytes | |
 | 0.15.2 | x86     | 3,090 bytes | |
-| 0.17.0 | x86_64  | 4,096 bytes | 7,900 bytes |
-| 0.17.0 | aarch64 | 3,624 bytes | 7,420 bytes |
-| 0.17.0 | x86     | 3,274 bytes | 6,343 bytes |
+| 0.17.0 | x86_64  | 4,096 bytes | 7,992 bytes |
+| 0.17.0 | aarch64 | 3,624 bytes | 7,516 bytes |
+| 0.17.0 | x86     | 3,274 bytes | 6,417 bytes |
 
 The tests check this table exactly.
 
