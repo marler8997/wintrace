@@ -252,11 +252,12 @@ fn drainSmallStderr(w: *std.Io.Writer, data: []const []const u8, splat: usize) e
 }
 
 fn writeSmallStderr(bytes: []const u8) error{WriteFailed}!void {
+    const stderr = windows.peb().ProcessParameters.hStdError;
     var rest = bytes;
     while (rest.len > 0) {
         var io_status: [2]usize = undefined;
-        const status = NtWriteFile(
-            windows.peb().ProcessParameters.hStdError,
+        var status = NtWriteFile(
+            stderr,
             null,
             null,
             null,
@@ -266,6 +267,11 @@ fn writeSmallStderr(bytes: []const u8) error{WriteFailed}!void {
             null,
             null,
         );
+        if (status == status_pending) {
+            // a handle opened for overlapped io, which is signaled when the write is done
+            if (NtWaitForSingleObject(stderr, 0, null) != 0) return error.WriteFailed;
+            status = @bitCast(@as(u32, @truncate(io_status[0])));
+        }
         // no stderr, or a pipe nobody reads anymore
         if (status < 0 or io_status[1] == 0) return error.WriteFailed;
         rest = rest[io_status[1]..];
@@ -913,6 +919,8 @@ extern "ntdll" fn NtWriteFile(
     byte_offset: ?*i64,
     key: ?*u32,
 ) callconv(.winapi) i32;
+const status_pending = 0x103;
+extern "ntdll" fn NtWaitForSingleObject(handle: ?*anyopaque, alertable: u8, timeout: ?*const i64) callconv(.winapi) i32;
 extern "ntdll" fn RtlPcToFileHeader(pc: usize, base: *?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetModuleFileNameW(module: *anyopaque, name: [*]u16, size: u32) callconv(.winapi) u32;
 extern "ntdll" fn RtlUnicodeToUTF8N(

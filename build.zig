@@ -102,6 +102,29 @@ pub fn build(b: *std.Build) void {
             run.addCheck(.{ .expect_stderr_match = crash[1] });
             test_step.dependOn(&run.step);
         }
+
+        // the same reports through a stderr opened for overlapped io, where a write can be
+        // pending when NtWriteFile returns
+        const run_overlapped = b.addExecutable(.{
+            .name = "run-overlapped",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/run-overlapped.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        for ([_][2][]const u8{
+            .{ "panic", "panic: fixture panic\n    wintrace\n    fixture-reports.exe+0x" },
+            .{ "segfault", "unhandled exception 0xC0000005 (access violation writing 0x8) at fixture-reports.exe+0x" },
+            .{ "error", "error: FixtureError\n" },
+        }) |crash| {
+            const run = b.addRunArtifact(run_overlapped);
+            run.setName(b.fmt("small mode {s}, overlapped stderr", .{crash[0]}));
+            run.addArtifactArg(fixture);
+            run.addArg(crash[0]);
+            run.addCheck(.{ .expect_stderr_match = crash[1] });
+            test_step.dependOn(&run.step);
+        }
     }
 
     // wintrace-symbolize itself, on a trace from a program built here
